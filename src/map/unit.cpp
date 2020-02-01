@@ -416,6 +416,9 @@ static TIMER_FUNC(unit_walktoxy_timer){
 			// Copying is required in case someone uses unitwalkto inside the event code
 			safestrncpy(walk_done_event, ud->walk_done_event, EVENT_NAME_LENGTH);
 
+			//Clear the event
+			ud->walk_done_event[0] = 0;
+
 			ud->state.walk_script = true;
 
 			// Execute the event
@@ -434,24 +437,19 @@ static TIMER_FUNC(unit_walktoxy_timer){
 				return 0;
 			}
 
-			// Check if another event was set
-			if( !strcmp(ud->walk_done_event,walk_done_event) ){
-				// If not remove it
-				ud->walk_done_event[0] = 0;
-			}
 		}
 	}
 
 	switch(bl->type) {
 		case BL_PC:
-			if( sd->touching_id )
+			if( !sd->npc_ontouch_.empty() )
 				npc_touchnext_areanpc(sd,false);
 			if(map_getcell(bl->m,x,y,CELL_CHKNPC)) {
 				npc_touch_areanpc(sd,bl->m,x,y);
 				if (bl->prev == NULL) // Script could have warped char, abort remaining of the function.
 					return 0;
 			} else
-				sd->areanpc_id=0;
+				sd->areanpc.clear();
 			pc_cell_basilica(sd);
 			break;
 		case BL_MOB:
@@ -971,7 +969,7 @@ bool unit_movepos(struct block_list *bl, short dst_x, short dst_y, int easy, boo
 	ud->walktimer = INVALID_TIMER;
 
 	if(sd) {
-		if( sd->touching_id )
+		if( !sd->npc_ontouch_.empty() )
 			npc_touchnext_areanpc(sd,false);
 
 		if(map_getcell(bl->m,bl->x,bl->y,CELL_CHKNPC)) {
@@ -980,9 +978,9 @@ bool unit_movepos(struct block_list *bl, short dst_x, short dst_y, int easy, boo
 			if (bl->prev == NULL) // Script could have warped char, abort remaining of the function.
 				return false;
 		} else
-			sd->areanpc_id=0;
+			sd->areanpc.clear();
 
-		if( sd->status.pet_id > 0 && sd->pd && sd->pd->pet.intimate > 0 ) {
+		if( sd->status.pet_id > 0 && sd->pd && sd->pd->pet.intimate > PET_INTIMATE_NONE ) {
 			// Check if pet needs to be teleported. [Skotlex]
 			int flag = 0;
 			struct block_list* pbl = &sd->pd->bl;
@@ -1089,7 +1087,7 @@ int unit_blown(struct block_list* bl, int dx, int dy, int count, enum e_skill_bl
 			map_foreachinmovearea(clif_outsight, bl, AREA_SIZE, dx, dy, bl->type == BL_PC ? BL_ALL : BL_PC, bl);
 
 			if(su) {
-				if (su->group && skill_get_unit_flag(su->group->skill_id)&UF_KNOCKBACK_GROUP)
+				if (su->group && skill_get_unit_flag(su->group->skill_id, UF_KNOCKBACKGROUP))
 					skill_unit_move_unit_group(su->group, bl->m, dx, dy);
 				else
 					skill_unit_move_unit(bl, nx, ny);
@@ -1102,13 +1100,13 @@ int unit_blown(struct block_list* bl, int dx, int dy, int count, enum e_skill_bl
 				clif_blown(bl);
 
 			if(sd) {
-				if(sd->touching_id)
+				if(!sd->npc_ontouch_.empty())
 					npc_touchnext_areanpc(sd, false);
 
 				if(map_getcell(bl->m, bl->x, bl->y, CELL_CHKNPC))
 					npc_touch_areanpc(sd, bl->m, bl->x, bl->y);
 				else
-					sd->areanpc_id = 0;
+					sd->areanpc.clear();
 			}
 		}
 
@@ -1125,6 +1123,7 @@ int unit_blown(struct block_list* bl, int dx, int dy, int count, enum e_skill_bl
  *		0x1 - Offensive (not set: self skill, e.g. Backslide)
  *		0x2 - Knockback type (not set: Stop type, e.g. Ankle Snare)
  *		0x4 - Boss attack
+ *		0x8 - Ignore target player 'special_state.no_knockback'
  * @return reason for immunity
  *		UB_KNOCKABLE - can be knocked back / stopped
  *		UB_NO_KNOCKBACK_MAP - at WOE/BG map
@@ -1153,14 +1152,14 @@ enum e_unit_blown unit_blown_immune(struct block_list* bl, uint8 flag)
 				if( !(flag&0x4) && sd->sc.data[SC_BASILICA] && sd->sc.data[SC_BASILICA]->val4 == sd->bl.id)
 					return UB_TARGET_BASILICA;
 				// Target has special_state.no_knockback (equip)
-				if( (flag&(0x1|0x2)) && sd->special_state.no_knockback )
+				if( (flag&(0x1|0x2)) && !(flag&0x8) && sd->special_state.no_knockback )
 					return UB_TARGET_NO_KNOCKBACK;
 			}
 			break;
 		case BL_SKILL: {
 				struct skill_unit* su = (struct skill_unit *)bl;
 				// Trap cannot be knocked back
-				if (su && su->group && skill_get_unit_flag(su->group->skill_id)&UF_NOKNOCKBACK)
+				if (su && su->group && skill_get_unit_flag(su->group->skill_id, UF_NOKNOCKBACK))
 					return UB_TARGET_TRAP;
 			}
 			break;
@@ -1242,6 +1241,12 @@ int unit_warp(struct block_list *bl,short m,short x,short y,clr_type type)
 	bl->x = ud->to_x = x;
 	bl->y = ud->to_y = y;
 	bl->m = m;
+
+	if (bl->type == BL_NPC) {
+		TBL_NPC *nd = (TBL_NPC*)bl;
+		map_addnpc(m, nd);
+		npc_setcells(nd);
+	}
 
 	if(map_addblock(bl))
 		return 4; //error on adding bl to map
@@ -1370,13 +1375,13 @@ int unit_can_move(struct block_list *bl) {
 	if (!ud)
 		return 0;
 
-	if (ud->skilltimer != INVALID_TIMER && ud->skill_id != LG_EXEEDBREAK && (!sd || !pc_checkskill(sd, SA_FREECAST) || skill_get_inf2(ud->skill_id)&INF2_GUILD_SKILL))
+	if (ud->skilltimer != INVALID_TIMER && ud->skill_id != LG_EXEEDBREAK && (!sd || !pc_checkskill(sd, SA_FREECAST) || skill_get_inf2(ud->skill_id, INF2_ISGUILD)))
 		return 0; // Prevent moving while casting
 
 	if (DIFF_TICK(ud->canmove_tick, gettick()) > 0)
 		return 0;
 
-	if ((sd && (pc_issit(sd) || sd->state.vending || sd->state.buyingstore)) || ud->state.blockedmove)
+	if ((sd && (pc_issit(sd) || sd->state.vending || sd->state.buyingstore || (sd->state.block_action & PCBLOCK_MOVE))) || ud->state.blockedmove)
 		return 0; // Can't move
 
 	// Status changes that block movement
@@ -1510,8 +1515,6 @@ int unit_skilluse_id2(struct block_list *src, int target_id, uint16 skill_id, ui
 	struct block_list * target = NULL;
 	t_tick tick = gettick();
 	int combo = 0, range;
-	uint8 inf = 0;
-	uint32 inf2 = 0;
 
 	nullpo_ret(src);
 
@@ -1532,8 +1535,8 @@ int unit_skilluse_id2(struct block_list *src, int target_id, uint16 skill_id, ui
 	if (sc && !sc->count)
 		sc = NULL; // Unneeded
 
-	inf = skill_get_inf(skill_id);
-	inf2 = skill_get_inf2(skill_id);
+	int inf = skill_get_inf(skill_id);
+	std::shared_ptr<s_skill_db> skill = skill_db.find(skill_id);
 
 	// temp: used to signal combo-skills right now.
 	if (sc && sc->data[SC_COMBO] &&
@@ -1547,13 +1550,13 @@ int unit_skilluse_id2(struct block_list *src, int target_id, uint16 skill_id, ui
 		else if (target_id == src->id || ud->target > 0)
 			target_id = ud->target;
 
-		if (inf&INF_SELF_SKILL && skill_get_nk(skill_id)&NK_NO_DAMAGE)// exploit fix
+		if (inf&INF_SELF_SKILL && skill->nk[NK_NODAMAGE])// exploit fix
 			target_id = src->id;
 
 		combo = 1;
 	} else if ( target_id == src->id &&
 		inf&INF_SELF_SKILL &&
-		(inf2&INF2_NO_TARGET_SELF ||
+		(skill->inf2[INF2_NOTARGETSELF] ||
 		(skill_id == RL_QD_SHOT && sc && sc->data[SC_QD_SHOT_READY])) ) {
 		target_id = ud->target; // Auto-select target. [Skotlex]
 		combo = 1;
@@ -1627,14 +1630,14 @@ int unit_skilluse_id2(struct block_list *src, int target_id, uint16 skill_id, ui
 	if(ud->skilltimer != INVALID_TIMER && skill_id != SA_CASTCANCEL && skill_id != SO_SPELLFIST)
 		return 0;
 
-	if(inf2&INF2_NO_TARGET_SELF && src->id == target_id)
+	if(skill->inf2[INF2_NOTARGETSELF] && src->id == target_id)
 		return 0;
 
 	if(!status_check_skilluse(src, target, skill_id, 0))
 		return 0;
 
 	// Fail if the targetted skill is near NPC [Cydh]
-	if(inf2&INF2_NO_NEARNPC && skill_isNotOk_npcRange(src,skill_id,skill_lv,target->x,target->y)) {
+	if(skill->inf2[INF2_DISABLENEARNPC] && skill_isNotOk_npcRange(src,skill_id,skill_lv,target->x,target->y)) {
 		if (sd)
 			clif_skill_fail(sd,skill_id,USESKILL_FAIL_LEVEL,0);
 
@@ -1998,6 +2001,8 @@ int unit_skilluse_pos2( struct block_list *src, short skill_x, short skill_y, ui
 	if( sd ) {
 		if( skill_isNotOk(skill_id, sd) || !skill_check_condition_castbegin(sd, skill_id, skill_lv) )
 			return 0;
+		if (skill_id == MG_FIREWALL && !skill_pos_maxcount_check(src, skill_x, skill_y, skill_id, skill_lv, BL_PC, true))
+			return 0; // Special check for Firewall only
 	}
 
 	if( (skill_id >= SC_MANHOLE && skill_id <= SC_FEINTBOMB) && map_getcell(src->m, skill_x, skill_y, CELL_CHKMAELSTROM) ) {
@@ -2009,7 +2014,7 @@ int unit_skilluse_pos2( struct block_list *src, short skill_x, short skill_y, ui
 		return 0;
 
 	// Fail if the targetted skill is near NPC [Cydh]
-	if(skill_get_inf2(skill_id)&INF2_NO_NEARNPC && skill_isNotOk_npcRange(src,skill_id,skill_lv,skill_x,skill_y)) {
+	if(skill_get_inf2(skill_id, INF2_DISABLENEARNPC) && skill_isNotOk_npcRange(src,skill_id,skill_lv,skill_x,skill_y)) {
 		if (sd)
 			clif_skill_fail(sd,skill_id,USESKILL_FAIL_LEVEL,0);
 
@@ -2955,7 +2960,7 @@ int unit_remove_map_(struct block_list *bl, clr_type clrtype, const char* file, 
 			if(sd->menuskill_id)
 				sd->menuskill_id = sd->menuskill_val = 0;
 
-			if( sd->touching_id )
+			if( !sd->npc_ontouch_.empty() )
 				npc_touchnext_areanpc(sd,true);
 
 			// Check if warping and not changing the map.
@@ -3033,7 +3038,7 @@ int unit_remove_map_(struct block_list *bl, clr_type clrtype, const char* file, 
 		case BL_PET: {
 			struct pet_data *pd = (struct pet_data*)bl;
 
-			if( pd->pet.intimate <= 0 && !(pd->master && !pd->master->state.active) ) {
+			if( pd->pet.intimate <= PET_INTIMATE_NONE && !(pd->master && !pd->master->state.active) ) {
 				// If logging out, this is deleted on unit_free
 				clif_clearunit_area(bl,clrtype);
 				map_delblock(bl);
@@ -3091,6 +3096,10 @@ int unit_remove_map_(struct block_list *bl, clr_type clrtype, const char* file, 
 			}
 			break;
 		}
+		case BL_NPC:
+			if (npc_remove_map( (TBL_NPC*)bl ) != 0)
+				return 0;
+			break;
 		default:
 			break;// do nothing
 	}
@@ -3099,14 +3108,47 @@ int unit_remove_map_(struct block_list *bl, clr_type clrtype, const char* file, 
 		skill_unit_move(bl,gettick(),4);
 		skill_cleartimerskill(bl);
 	}
-	// /BL_MOB is handled by mob_dead unless the monster is not dead.
-	if( bl->type != BL_MOB || !status_isdead(bl) )
-		clif_clearunit_area(bl,clrtype);
 
-	map_delblock(bl);
+	switch (bl->type) {
+		case BL_NPC:
+			// already handled by npc_remove_map
+			break;
+		case BL_MOB:
+			// /BL_MOB is handled by mob_dead unless the monster is not dead.
+			if (status_isdead(bl)) {
+				map_delblock(bl);
+				break;
+			}
+			// Fall through
+		default:
+			clif_clearunit_area(bl, clrtype);
+			map_delblock(bl);
+			break;
+	}
+
 	map_freeblock_unlock();
 
 	return 1;
+}
+
+/**
+ * Refresh the area with a change in display of a unit.
+ * @bl: Object to update
+ */
+void unit_refresh(struct block_list *bl) {
+	nullpo_retv(bl);
+
+	if (bl->m < 0)
+		return;
+
+	struct map_data *mapdata = map_getmapdata(bl->m);
+
+	// Using CLR_TRICKDEAD because other flags show effects
+	// Probably need to use another flag or other way to refresh it
+	if (mapdata->users) {
+		clif_clearunit_area(bl, CLR_TRICKDEAD); // Fade out
+		clif_spawn(bl); // Fade in
+	}
 }
 
 /**
@@ -3258,6 +3300,9 @@ int unit_free(struct block_list *bl, clr_type clrtype)
 			// Clearing...
 			if (sd->bonus_script.head)
 				pc_bonus_script_clear(sd, BSF_REM_ALL);
+
+			skill_clear_unitgroup(bl);
+			status_change_clear(bl,1);
 			break;
 		}
 		case BL_PET: {
@@ -3265,51 +3310,9 @@ int unit_free(struct block_list *bl, clr_type clrtype)
 			struct map_session_data *sd = pd->master;
 
 			pet_hungry_timer_delete(pd);
+			pet_clear_support_bonuses(sd);
 
-			if( pd->a_skill ) {
-				aFree(pd->a_skill);
-				pd->a_skill = NULL;
-			}
-
-			if( pd->s_skill ) {
-				if (pd->s_skill->timer != INVALID_TIMER) {
-					if (pd->s_skill->id)
-						delete_timer(pd->s_skill->timer, pet_skill_support_timer);
-					else
-						delete_timer(pd->s_skill->timer, pet_heal_timer);
-				}
-
-				aFree(pd->s_skill);
-				pd->s_skill = NULL;
-			}
-
-			if( pd->recovery ) {
-				if(pd->recovery->timer != INVALID_TIMER)
-					delete_timer(pd->recovery->timer, pet_recovery_timer);
-
-				aFree(pd->recovery);
-				pd->recovery = NULL;
-			}
-
-			if( pd->bonus ) {
-				if (pd->bonus->timer != INVALID_TIMER)
-					delete_timer(pd->bonus->timer, pet_skill_bonus_timer);
-
-				aFree(pd->bonus);
-				pd->bonus = NULL;
-			}
-
-			if( pd->loot ) {
-				pet_lootitem_drop(pd,sd);
-
-				if (pd->loot->item)
-					aFree(pd->loot->item);
-
-				aFree (pd->loot);
-				pd->loot = NULL;
-			}
-
-			if( pd->pet.intimate > 0 )
+			if( pd->pet.intimate > PET_INTIMATE_NONE )
 				intif_save_petdata(pd->pet.account_id,&pd->pet);
 			else { // Remove pet.
 				intif_delete_petdata(pd->pet.pet_id);
@@ -3321,6 +3324,9 @@ int unit_free(struct block_list *bl, clr_type clrtype)
 			if( sd )
 				sd->pd = NULL;
 			pd->master = NULL;
+
+			skill_clear_unitgroup(bl);
+			status_change_clear(bl,1);
 			break;
 		}
 		case BL_MOB: {
@@ -3376,6 +3382,9 @@ int unit_free(struct block_list *bl, clr_type clrtype)
 				md->base_status = NULL;
 			}
 
+			skill_clear_unitgroup(bl);
+			status_change_clear(bl,1);
+
 			if( mob_is_clone(md->mob_id) )
 				mob_clone_delete(md);
 
@@ -3402,6 +3411,9 @@ int unit_free(struct block_list *bl, clr_type clrtype)
 			if( sd )
 				sd->hd = NULL;
 			hd->master = NULL;
+
+			skill_clear_unitgroup(bl);
+			status_change_clear(bl,1);
 			break;
 		}
 		case BL_MER: {
@@ -3422,6 +3434,9 @@ int unit_free(struct block_list *bl, clr_type clrtype)
 
 			mercenary_contract_stop(md);
 			md->master = NULL;
+
+			skill_clear_unitgroup(bl);
+			status_change_clear(bl,1);
 			break;
 		}
 		case BL_ELEM: {
@@ -3442,12 +3457,13 @@ int unit_free(struct block_list *bl, clr_type clrtype)
 
 			elemental_summon_stop(ed);
 			ed->master = NULL;
+
+			skill_clear_unitgroup(bl);
+			status_change_clear(bl,1);
 			break;
 		}
 	}
 
-	skill_clear_unitgroup(bl);
-	status_change_clear(bl,1);
 	map_deliddb(bl);
 
 	if( bl->type != BL_PC ) // Players are handled by map_quit

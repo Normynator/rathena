@@ -6,6 +6,7 @@
 
 #include <vector>
 
+#include "../common/database.hpp"
 #include "../common/mmo.hpp" // struct item
 #include "../common/timer.hpp"
 
@@ -243,6 +244,17 @@ struct mob_data {
 	int tomb_nid;
 };
 
+class MobAvailDatabase : public YamlDatabase {
+public:
+	MobAvailDatabase() : YamlDatabase("MOB_AVAIL_DB", 1) {
+
+	}
+
+	void clear() { };
+	const std::string getDefaultLocation();
+	uint64 parseBodyNode(const YAML::Node& node);
+};
+
 enum e_mob_skill_target {
 	MST_TARGET	=	0,
 	MST_RANDOM,	//Random Target!
@@ -301,6 +313,7 @@ struct item_drop_list {
 
 struct mob_db *mob_db(int mob_id);
 uint16 mobdb_searchname(const char * const str);
+struct mob_db* mobdb_search_aegisname( const char* str );
 int mobdb_searchname_array(const char *str, uint16 * out, int size);
 int mobdb_checkid(const int id);
 struct view_data* mob_get_viewdata(int mob_id);
