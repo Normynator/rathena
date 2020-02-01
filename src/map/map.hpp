@@ -16,6 +16,7 @@
 #include "../common/mmo.hpp"
 #include "../common/msg_conf.hpp"
 #include "../common/timer.hpp"
+//test test
 #include "../config/core.hpp"
 
 struct npc_data;
